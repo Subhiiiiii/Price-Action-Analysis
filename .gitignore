@@ -1,0 +1,5 @@
+# Ignore everything inside data/
+data/*
+
+# But track ohlc.py
+!data/ohlc.py
