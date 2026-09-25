@@ -1,5 +1,9 @@
+# Python cache
+__pycache__/
+*.pyc
+
 # Ignore everything inside data/
 data/*
 
-# But track ohlc.py
+# But track this file
 !data/ohlc.py
