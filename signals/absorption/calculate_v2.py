@@ -136,7 +136,7 @@ def calculate_absorption_v2(
     delta = buy_v - sell_v
 
     # ── 1. Normalised delta = delta / rolling_avg_volume ──────────────────────
-    avg_vol=1
+    #avg_vol=1 without normalisation
     # avg_vol = (
     #     volume
     #     .shift(1)
@@ -158,12 +158,12 @@ def calculate_absorption_v2(
         axis=1,
     ).max(axis=1)
 
-    # atr = (
-    #     tr.shift(1)
-    #     .rolling(atr_window, min_periods=max(3, atr_window // 2))
-    #     .mean()
-    # )
-    atr=1
+    atr = (
+        tr.shift(1)
+        .rolling(atr_window, min_periods=max(3, atr_window // 2))
+        .mean()
+    )
+    #atr=1
     normalised_price = price_response / (atr + _EPS)
 
     # ── 3. Causal robust z-scores ─────────────────────────────────────────────
