@@ -137,12 +137,12 @@ def calculate_absorption_v2(
 
     # ── 1. Normalised delta = delta / rolling_avg_volume ──────────────────────
     #avg_vol=1 without normalisation
-    # avg_vol = (
-    #     volume
-    #     .shift(1)
-    #     .rolling(volume_window, min_periods=max(3, volume_window // 2))
-    #     .mean()
-    # )
+    avg_vol = (
+        volume
+        .shift(1)
+        .rolling(volume_window, min_periods=max(3, volume_window // 2))
+        .mean()
+    )
     normalised_delta = delta / (avg_vol + _EPS)
 
     # ── 2. Normalised price response = (close - prev_close) / ATR ────────────

@@ -1,60 +1,66 @@
 # market_analysis/finding_threshold/absorption_v2_threshold.py
 """
-Absorption Method-2 threshold analysis.
+Absorption Method-2 — threshold / parameter search.
 
-Entry point for the notebook:
+THREE analysis modes, all callable from the notebook:
 
+    run_heatmap_analysis()         — per-instrument z-score heatmap
+                                     (delta_z_threshold × price_z_threshold grid)
+                                     + score distribution plots.
+
+    run_threshold_sweep()          — per-instrument 1D sweep over absorption_score,
+                                     producing Precision / Recall / F1 / MCC / Lift
+                                     table (same as absorption_v2_threshold.py but
+                                     consistent with v2 internals).
+
+    run_heatmap_by_structure()     — same as run_heatmap_analysis() but pools all
+                                     instruments per structure type (spread / jumbo)
+                                     into one heatmap instead of one per instrument.
+
+All three share the same fetch-once / label-twice trick:
+    1. score every bar with calculate_absorption_v2()  (dummy thresholds so
+       every bar gets z_delta / z_price computed)
+    2. run label_absorption_atr() twice — once forcing BUY, once forcing SELL
+       — so every bar has a valid BUY outcome AND a valid SELL outcome
+    3. apply the actual threshold masks at query time (no re-labeling needed)
+
+This means the expensive labeling loop runs exactly twice per instrument,
+not once per threshold combination.
+
+Usage
+-----
     from market_analysis.finding_threshold.absorption_v2_threshold import (
-        run_absorption_v2_threshold_analysis,
+        run_heatmap_analysis,
+        run_threshold_sweep,
+        run_heatmap_by_structure,
     )
 
-    results = run_absorption_v2_threshold_analysis(
-        product_code = "BO",
-        timeframe    = "1d",         # "1d" | "1h"
-        months_back  = 7,
-        score_grid   = np.arange(0.05, 1.0, 0.05),
-        front_n      = 5,
-    )
+    # Heatmap — one plot per instrument
+    run_heatmap_analysis(product_code="SM", months_back=8)
 
-What it does per instrument (spread × front_n + jumbo × front_n):
-  1. Fetch 1D or 1H OHLC (same helpers as the rest of the project).
-  2. Run calculate_absorption_v2() — Method-2 z-score scorer.
-  3. Label with label_absorption_atr() (ATR-based, profit-first).
-  4. Sweep absorption_score thresholds → F1 / Precision / Recall / MCC / Lift
-     table per instrument (BUY + SELL pooled).
-  5. Show a 3-panel distribution plot: Success | Failure | Overlay.
+    # Threshold sweep table
+    run_threshold_sweep(product_code="SM", months_back=8)
 
-ATR labeling logic
-------------------
-    BUY  direction (expect price DOWN):
-        target = close[t] - ATR[t] * target_atr_mult
-        stop   = close[t] + ATR[t] * stop_atr_mult
-
-    SELL direction (expect price UP):
-        target = close[t] + ATR[t] * target_atr_mult
-        stop   = close[t] - ATR[t] * stop_atr_mult
-
-    Forward scan: profit-first (target hit before stop = success).
-    Ambiguous same-bar hits resolved with hourly data when available.
-
-All config defaults come from config.ABSORPTION_V2 (or fall back to
-ABSORPTION if that key is absent).
+    # Pooled heatmap per structure type
+    run_heatmap_by_structure(product_code="SM", months_back=8)
 """
 
 from __future__ import annotations
 
-import sys
 import datetime
 import calendar
+import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import seaborn as sns
 from IPython.display import display
 
-# ── project root ──────────────────────────────────────────────────────────────
+# ── project root resolution ───────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent   # .../finding_threshold/
 _ROOT = _HERE.parent                       # .../market_analysis/
 _DOCS = _ROOT.parent                       # .../Documents/
@@ -62,17 +68,11 @@ for _p in [str(_DOCS), str(_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# ── project imports ───────────────────────────────────────────────────────────
-from market_analysis.config import (
-    PRODUCTS, FRONT_N,
-    ABSORPTION as ABS_CFG,
-    ABSORPTION_1H as ABS_1H_CFG,
-)
+from market_analysis.config import PRODUCTS, FRONT_N
 from market_analysis.utils.contracts import get_all_front_instruments
-from market_analysis.data.ohlc import (
-    fetch_ohlc_1d, fetch_ohlc_1h, getData_OHLC_v2,
-)
+from market_analysis.data.ohlc import fetch_ohlc_1d, getData_OHLC_v2
 from market_analysis.signals.absorption.calculate_v2 import calculate_absorption_v2
+from market_analysis.signals.absorption.calculate_rolling import calculate_absorption_rolling
 from market_analysis.signals.absorption.label import label_absorption_atr
 from market_analysis.utils.metrics import _block_bootstrap_ci
 
@@ -82,66 +82,337 @@ try:
 except ImportError:
     _SKLEARN = False
 
-# ── colours ───────────────────────────────────────────────────────────────────
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# ── palette ───────────────────────────────────────────────────────────────────
 _C_SUCCESS = "seagreen"
-_C_FAILURE = "tomato"
-_C_SWEEP   = "steelblue"
+_C_FAILURE  = "tomato"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG FALLBACK
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Default Method-2 params — override any key via the v2_params argument.
-_DEFAULT_V2_PARAMS: dict = {
-    # z-score model
-    "volume_window"      : 5,
-    "atr_window"         : 5,
-    "baseline_window"    : 15,
-    "delta_z_threshold"  : 2.0,
-    "price_z_threshold"  : 0.75,
-    # ATR labeling
-    "atr_period"         : 14,
-    "target_atr_mult"    : 1.0,
-    "stop_atr_mult"      : 1.0,
-    "forward_days"       : 10,
+# ── default scorer + labeler params ───────────────────────────────────────────
+_DEFAULT_PARAMS: dict = {
+    # z-score scorer windows
+    "volume_window"    : 5,
+    "atr_window"       : 5,
+    "baseline_window"  : 15,
+    # dummy thresholds used only to score every bar (real thresholds swept)
+    "delta_z_threshold": 0,
+    "price_z_threshold": 9999,
+    # ATR labeler
+    "atr_period"       : 14,
+    "target_atr_mult"  : 1.0,
+    "stop_atr_mult"    : 1.0,
+    "forward_days"     : 10,
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
+# INTERNAL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _months_back_start(months: int) -> str:
+def _start_date(months_back: int) -> str:
     today = datetime.date.today()
-    year  = today.year
-    month = today.month - months
-    while month <= 0:
-        month += 12
-        year  -= 1
-    day = min(today.day, calendar.monthrange(year, month)[1])
-    return datetime.date(year, month, day).strftime("%Y-%m-%d")
+    y, m  = today.year, today.month - months_back
+    while m <= 0:
+        m += 12; y -= 1
+    d = min(today.day, calendar.monthrange(y, m)[1])
+    return datetime.date(y, m, d).strftime("%Y-%m-%d")
 
 
-def _make_threshold_table(
-    labeled_df   : pd.DataFrame,
-    score_col    : str,
-    success_col  : str,
+def _fetch_score_label(
+    instrument: str,
+    product_code: str,
+    start_date: str,
+    end_date: str,
+    params: dict,
+    combined_candle: int = 1,          # ← new param
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+
+    df = fetch_ohlc_1d(instrument, product_code, getData_OHLC_v2,
+                        start_date, end_date)
+    if df is None or len(df) < 30:
+        return None, None, None
+
+    # ── score (with rolling candle support) ───────────────────────────────────
+    try:
+        if combined_candle == 1:
+            # standard path — identical to before
+            df_scored = calculate_absorption_v2(
+                df,
+                volume_window      = params["volume_window"],
+                atr_window         = params["atr_window"],
+                baseline_window    = params["baseline_window"],
+                delta_z_threshold  = params["delta_z_threshold"],
+                price_z_threshold  = params["price_z_threshold"],
+            )
+        else:
+            # rolling N-day candle path — uses calculate_rolling.py
+            df_scored = calculate_absorption_rolling(
+                df,
+                combined_candle    = combined_candle,
+                method             = "v2",
+                volume_window      = params["volume_window"],
+                atr_window         = params["atr_window"],
+                baseline_window    = params["baseline_window"],
+                delta_z_threshold  = params["delta_z_threshold"],
+                price_z_threshold  = params["price_z_threshold"],
+            )
+    except Exception as e:
+        print(f"  [WARN] Scoring failed for {instrument}: {e}")
+        return None, None, None
+
+    real_direction = df_scored["absorption_direction"].copy()
+
+    df_scored["absorption_direction"] = "BUY"
+    try:
+        df_buy = label_absorption_atr(
+            df_scored,
+            atr_period      = params["atr_period"],
+            target_atr_mult = params["target_atr_mult"],
+            stop_atr_mult   = params["stop_atr_mult"],
+            forward_days    = params["forward_days"],
+        )
+    except Exception as e:
+        print(f"  [WARN] BUY labeling failed for {instrument}: {e}")
+        return None, None, None
+
+    df_scored["absorption_direction"] = "SELL"
+    try:
+        df_sell = label_absorption_atr(
+            df_scored,
+            atr_period      = params["atr_period"],
+            target_atr_mult = params["target_atr_mult"],
+            stop_atr_mult   = params["stop_atr_mult"],
+            forward_days    = params["forward_days"],
+        )
+    except Exception as e:
+        print(f"  [WARN] SELL labeling failed for {instrument}: {e}")
+        return None, None, None
+
+    df_scored["absorption_direction"] = real_direction
+    return df_scored, df_buy, df_sell
+
+
+
+
+def _heatmap_matrices(
+    df_scored    : pd.DataFrame,
+    df_buy       : pd.DataFrame,
+    df_sell      : pd.DataFrame,
+    delta_z_grid : np.ndarray,
+    price_z_grid : np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build (heat_rate, annot_labels) matrices for the given threshold grids.
+
+    heat_rate[i, j] = success rate when  |z_delta| >= delta_z_grid[j]
+                                    AND   z_price   <= price_z_grid[i]
+
+    Annotation format per cell: "S: N\\nF: N\\nN: N\\nAvg: 0.XX"
+        S = successes (BUY + SELL)
+        F = failures
+        N = total valid
+        Avg = mean absorption_score of qualifying bars
+    """
+    n_price = len(price_z_grid)
+    n_delta = len(delta_z_grid)
+
+    heat_rate    = np.full((n_price, n_delta), np.nan)
+    annot_labels = np.empty((n_price, n_delta), dtype=object)
+
+    z_delta_col = df_scored["z_delta"].values
+    z_price_col = df_scored["z_price"].values
+    score_col   = df_scored["absorption_score"].values
+    buy_success = df_buy["sl_success"].values
+    sell_success= df_sell["sl_success"].values
+
+    for i, pz in enumerate(price_z_grid):
+        for j, dz in enumerate(delta_z_grid):
+
+            buy_mask  = (z_delta_col >= dz)  & (z_price_col <= pz)
+            sell_mask = (z_delta_col <= -dz) & (z_price_col <= pz)
+
+            # outcomes from the pre-labeled frames
+            buy_succ  = int(np.nansum((buy_success[buy_mask]   == 1.0)))
+            buy_fail  = int(np.nansum((buy_success[buy_mask]   == 0.0)))
+            sell_succ = int(np.nansum((sell_success[sell_mask] == 1.0)))
+            sell_fail = int(np.nansum((sell_success[sell_mask] == 0.0)))
+
+            tot_succ  = buy_succ  + sell_succ
+            tot_fail  = buy_fail  + sell_fail
+            tot_valid = tot_succ  + tot_fail
+
+            combined_mask = buy_mask | sell_mask
+            avg_score = (
+                float(np.nanmean(score_col[combined_mask]))
+                if combined_mask.sum() > 0 else np.nan
+            )
+
+            if tot_valid > 0:
+                heat_rate[i, j]    = tot_succ / tot_valid
+                annot_labels[i, j] = (
+                    f"S:{tot_succ} F:{tot_fail}\n"
+                    f"N:{tot_valid} Avg:{avg_score:.2f}"
+                )
+            else:
+                heat_rate[i, j]    = np.nan
+                annot_labels[i, j] = "N/A"
+
+    return heat_rate, annot_labels
+
+
+def _plot_heatmap(
+    heat_rate    : np.ndarray,
+    annot_labels : np.ndarray,
+    delta_z_grid : np.ndarray,
+    price_z_grid : np.ndarray,
+    title        : str,
+    params       : dict,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    sns.heatmap(
+        heat_rate,
+        annot  = annot_labels,
+        fmt    = "",
+        cmap   = "RdYlGn",
+        vmin   = 0.30,
+        vmax   = 0.70,
+        ax     = ax,
+        cbar_kws = {"label": "Success Rate"},
+        linewidths = 0.4,
+        linecolor  = "white",
+    )
+
+    ax.set_xticklabels([f"{dz:.2f}" for dz in delta_z_grid], rotation=0)
+    ax.set_yticklabels([f"{pz:.2f}" for pz in price_z_grid], rotation=0)
+    ax.invert_yaxis()
+
+    ax.set_xlabel("Min |z_delta|  (larger = rarer, stronger delta signal)", labelpad=8)
+    ax.set_ylabel("Max z_price   (lower = smaller price move = stronger absorption)", labelpad=8)
+
+    fwd = params["forward_days"]
+    T   = params["target_atr_mult"]
+    S   = params["stop_atr_mult"]
+    ap  = params["atr_period"]
+    ax.set_title(
+        f"{title}\n"
+        f"ATR period={ap}  target×{T}  stop×{S}  fwd={fwd}d  "
+        f"vol_win={params['volume_window']}  atr_win={params['atr_window']}  "
+        f"base_win={params['baseline_window']}",
+        fontsize=11,
+    )
+    plt.tight_layout()
+    return fig
+
+
+def _plot_distribution(
+    df_scored    : pd.DataFrame,
+    df_buy       : pd.DataFrame,
+    df_sell      : pd.DataFrame,
+    title        : str,
+) -> plt.Figure:
+    """
+    3-panel success/failure distribution of absorption_score
+    using the real direction from df_scored.
+    """
+    real_dir  = df_scored["absorption_direction"]
+    buy_mask  = real_dir == "BUY"
+    sell_mask = real_dir == "SELL"
+
+    # Assign outcomes using real direction
+    final_success = pd.Series(np.nan, index=df_scored.index)
+    final_success.loc[buy_mask]  = df_buy.loc[buy_mask,  "sl_success"].values
+    final_success.loc[sell_mask] = df_sell.loc[sell_mask, "sl_success"].values
+
+    valid = df_scored.copy()
+    valid["_suc"] = final_success
+    valid = valid.dropna(subset=["_suc"])
+
+    n_valid = len(valid)
+    if n_valid == 0:
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.text(0.5, 0.5, "No valid labelled rows", ha="center", va="center",
+                transform=ax.transAxes, fontsize=13)
+        ax.set_title(title)
+        return fig
+
+    s_scores = valid.loc[valid["_suc"] == 1.0, "absorption_score"]
+    f_scores = valid.loc[valid["_suc"] == 0.0, "absorption_score"]
+    n_succ   = len(s_scores)
+    n_fail   = len(f_scores)
+    base     = n_succ / n_valid
+
+    bins = np.arange(0, 1.05, 0.05)
+
+    fig = plt.figure(figsize=(16, 5))
+    gs  = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
+    ax1, ax2, ax3 = (fig.add_subplot(gs[k]) for k in range(3))
+
+    for ax, data, label, color in [
+        (ax1, s_scores, f"Success  n={n_succ}", _C_SUCCESS),
+        (ax2, f_scores, f"Failure  n={n_fail}", _C_FAILURE),
+    ]:
+        ax.hist(data, bins=bins, color=color, edgecolor="white", alpha=0.85)
+        ax.set_title(label, fontweight="bold", fontsize=11)
+        ax.set_xlabel("Absorption Score")
+        ax.set_ylabel("Count")
+        ax.set_xlim([0, 1])
+        ax.grid(axis="y", alpha=0.3)
+
+    ax3.hist(s_scores, bins=bins, color=_C_SUCCESS, edgecolor="white",
+             alpha=0.55, density=True, label=f"Success n={n_succ}")
+    ax3.hist(f_scores, bins=bins, color=_C_FAILURE, edgecolor="white",
+             alpha=0.55, density=True, label=f"Fail n={n_fail}")
+    ax3.set_title("Overlay (density)", fontweight="bold", fontsize=11)
+    ax3.set_xlabel("Absorption Score")
+    ax3.set_ylabel("Density")
+    ax3.set_xlim([0, 1])
+    ax3.legend(fontsize=9)
+    ax3.grid(alpha=0.3)
+
+    fig.suptitle(
+        f"{title}  |  valid={n_valid}  success={n_succ}  fail={n_fail}  base={base:.3f}",
+        fontsize=10, y=1.02,
+    )
+    plt.tight_layout()
+    return fig
+
+
+def _make_sweep_table(
+    df_scored    : pd.DataFrame,
+    df_buy       : pd.DataFrame,
+    df_sell      : pd.DataFrame,
     score_grid   : np.ndarray,
-    min_n        : int   = 8,
-    n_bootstrap  : int   = 500,
-    random_seed  : int   = 42,
-    forward_bars : int   = 10,
+    min_n        : int,
+    n_bootstrap  : int,
+    random_seed  : int,
+    forward_days : int,
 ) -> tuple[pd.DataFrame, float]:
-    """Sweep score_grid and return (table_df, base_rate)."""
-    valid = labeled_df.dropna(subset=[success_col]).reset_index(drop=True)
+    """
+    Sweep absorption_score thresholds and compute Precision/Recall/F1/MCC/Lift.
+
+    Uses the real absorption_direction to pick BUY or SELL outcomes per row.
+    """
+    real_dir      = df_scored["absorption_direction"]
+    buy_mask      = real_dir == "BUY"
+    sell_mask     = real_dir == "SELL"
+
+    final_success = pd.Series(np.nan, index=df_scored.index)
+    final_success.loc[buy_mask]  = df_buy.loc[buy_mask,  "sl_success"].values
+    final_success.loc[sell_mask] = df_sell.loc[sell_mask, "sl_success"].values
+
+    valid = df_scored.copy()
+    valid["_suc"]   = final_success
+    valid["_score"] = valid["absorption_score"]
+    valid = valid.dropna(subset=["_suc"]).reset_index(drop=True)
+
     if len(valid) == 0:
         return pd.DataFrame(), np.nan
 
-    base_rate  = float(valid[success_col].mean())
-    block_len  = forward_bars + 1
-    scores_arr = valid[score_col].values
-    labels_arr = valid[success_col].values
+    base_rate  = float(valid["_suc"].mean())
+    block_len  = forward_days + 1
+    scores_arr = valid["_score"].values
+    labels_arr = valid["_suc"].values
 
     rows = []
     for T in score_grid:
@@ -154,10 +425,10 @@ def _make_threshold_table(
         tn  = int((~sig & (lab == 0)).sum())
         ns  = tp + fp
 
-        prec = tp / ns          if ns > 0                else np.nan
-        rec  = tp / (tp + fn)   if (tp + fn) > 0         else np.nan
+        prec = tp / ns        if ns > 0              else np.nan
+        rec  = tp / (tp + fn) if (tp + fn) > 0       else np.nan
         f1   = (2 * prec * rec / (prec + rec)
-                if (np.isfinite(prec) and np.isfinite(rec) and (prec + rec) > 0)
+                if np.isfinite(prec) and np.isfinite(rec) and (prec + rec) > 0
                 else np.nan)
         lift = prec / base_rate if (np.isfinite(prec) and base_rate > 0) else np.nan
 
@@ -169,10 +440,10 @@ def _make_threshold_table(
                 pass
 
         ci     = _block_bootstrap_ci(sig, labels_arr, n_bootstrap, block_len, random_seed)
-        ci_str = (f"[{ci[0]:.3f}, {ci[1]:.3f}]" if np.isfinite(ci[0]) else "n/a")
+        ci_str = f"[{ci[0]:.3f},{ci[1]:.3f}]" if np.isfinite(ci[0]) else "n/a"
 
         rows.append({
-            "Score Thresh" : round(T, 3),
+            "Score Thresh" : round(float(T), 3),
             "N"            : ns,
             "Precision"    : prec,
             "Prec CI 95%"  : ci_str,
@@ -187,381 +458,406 @@ def _make_threshold_table(
     return pd.DataFrame(rows), base_rate
 
 
-def _pr_auc(labeled_df: pd.DataFrame, score_col: str, success_col: str) -> float:
-    if not _SKLEARN:
-        return np.nan
-    valid = labeled_df.dropna(subset=[success_col])
-    if valid[success_col].nunique() < 2:
-        return np.nan
-    prec_c, rec_c, _ = precision_recall_curve(
-        valid[success_col].astype(int), valid[score_col]
-    )
-    return float(sk_auc(rec_c, prec_c))
-
-
-def _styled_table(table: pd.DataFrame, caption: str = "") -> object:
+def _styled_sweep_table(table: pd.DataFrame, caption: str = "") -> object:
     float_cols = {
         c: "{:.3f}" for c in table.columns
         if pd.api.types.is_float_dtype(table[c])
     }
     float_cols["Score Thresh"] = "{:.3f}"
-    return (
+    styler = (
         table.style
         .format(float_cols, na_rep="—")
         .apply(
-            lambda row: [
-                "background-color: #fff3cd" if row["Low N"] else ""
-            ] * len(row),
+            lambda row: ["background-color: #fff3cd" if row["Low N"] else ""] * len(row),
             axis=1,
         )
-        .background_gradient(subset=["F1"],        cmap="RdYlGn", vmin=0.3, vmax=0.7)
-        .background_gradient(subset=["Precision"], cmap="Blues",  vmin=0.3, vmax=0.8)
         .set_caption(caption)
     )
+    if _SKLEARN:
+        styler = (
+            styler
+            .background_gradient(subset=["F1"],        cmap="RdYlGn", vmin=0.3, vmax=0.7)
+            .background_gradient(subset=["Precision"], cmap="Blues",  vmin=0.3, vmax=0.8)
+        )
+    return styler
 
 
-def _distribution_plot(
-    labeled_df  : pd.DataFrame,
-    score_col   : str,
-    success_col : str,
-    instrument  : str,
-    timeframe   : str,
-    v2_params   : dict,
-) -> plt.Figure:
-    """
-    3-panel distribution:
-        Panel 1  — Success histogram
-        Panel 2  — Failure histogram
-        Panel 3  — Density overlay of both
-    """
-    valid   = labeled_df.dropna(subset=[success_col])
-    n_valid = len(valid)
-
-    if n_valid == 0:
-        fig, ax = plt.subplots(figsize=(12, 4))
-        ax.text(0.5, 0.5, "No valid labelled rows", ha="center", va="center",
-                transform=ax.transAxes, fontsize=13)
-        ax.set_title(f"{instrument} [{timeframe}] — no data")
-        return fig
-
-    n_succ = int((valid[success_col] == 1.0).sum())
-    n_fail = int((valid[success_col] == 0.0).sum())
-    base   = n_succ / n_valid
-
-    s_scores = valid.loc[valid[success_col] == 1.0, score_col]
-    f_scores = valid.loc[valid[success_col] == 0.0, score_col]
-    bins     = np.arange(0, 1.05, 0.05)
-
-    fig = plt.figure(figsize=(17, 5))
-    gs  = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
-    ax1 = fig.add_subplot(gs[0])
-    ax2 = fig.add_subplot(gs[1])
-    ax3 = fig.add_subplot(gs[2])
-
-    for ax, data, label, color in [
-        (ax1, s_scores, f"Success  n={n_succ}", _C_SUCCESS),
-        (ax2, f_scores, f"Failure  n={n_fail}", _C_FAILURE),
-    ]:
-        ax.hist(data, bins=bins, color=color, edgecolor="white", alpha=0.85)
-        ax.set_title(label, fontweight="bold", fontsize=11)
-        ax.set_xlabel("Absorption Score (Method 2)")
-        ax.set_ylabel("Count")
-        ax.set_xlim([0, 1])
-        ax.grid(axis="y", alpha=0.3)
-
-    ax3.hist(s_scores, bins=bins, color=_C_SUCCESS, edgecolor="white",
-             alpha=0.55, density=True, label=f"Success n={n_succ}")
-    ax3.hist(f_scores, bins=bins, color=_C_FAILURE, edgecolor="white",
-             alpha=0.55, density=True, label=f"Fail n={n_fail}")
-    ax3.set_title("Overlay (density)", fontweight="bold", fontsize=11)
-    ax3.set_xlabel("Absorption Score (Method 2)")
-    ax3.set_ylabel("Density")
-    ax3.set_xlim([0, 1])
-    ax3.legend(fontsize=8)
-    ax3.grid(alpha=0.3)
-
-    X = v2_params["delta_z_threshold"]
-    Y = v2_params["price_z_threshold"]
-    T = v2_params["target_atr_mult"]
-    S = v2_params["stop_atr_mult"]
-    fwd = v2_params["forward_days"]
-
-    fig.suptitle(
-        f"{instrument}  [{timeframe}]  —  Absorption Method 2  "
-        f"|  Δz≥{X}  Pz≤{Y}  |  ATR×{T}/×{S}  |  fwd={fwd}d\n"
-        f"valid={n_valid}  success={n_succ}  fail={n_fail}  base={base:.3f}",
-        fontsize=10, y=1.02,
-    )
-    plt.tight_layout()
-    return fig
+def _pr_auc(df_scored, df_buy, df_sell) -> float:
+    if not _SKLEARN:
+        return np.nan
+    real_dir      = df_scored["absorption_direction"]
+    buy_mask      = real_dir == "BUY"
+    sell_mask     = real_dir == "SELL"
+    final_success = pd.Series(np.nan, index=df_scored.index)
+    final_success.loc[buy_mask]  = df_buy.loc[buy_mask,  "sl_success"].values
+    final_success.loc[sell_mask] = df_sell.loc[sell_mask, "sl_success"].values
+    valid = df_scored.copy()
+    valid["_suc"] = final_success
+    valid = valid.dropna(subset=["_suc", "absorption_score"])
+    if valid["_suc"].nunique() < 2:
+        return np.nan
+    try:
+        p, r, _ = precision_recall_curve(valid["_suc"].astype(int),
+                                          valid["absorption_score"])
+        return float(sk_auc(r, p))
+    except Exception:
+        return np.nan
 
 
-def _print_instrument_header(
-    instrument   : str,
-    structure    : str,
-    product_code : str,
-    timeframe    : str,
-    start_date   : str,
-    end_date     : str,
-    v2_params    : dict,
-    tick_size    : float,
-    n_rows       : int,
-) -> None:
-    line = "─" * 70
-    print(f"\n{line}")
-    print(f"  {structure.upper()}  ▶  {instrument}  [{timeframe}]  ({product_code})")
-    print(line)
-    print(f"  Data window       : {start_date}  →  {end_date}  ({n_rows} bars)")
-    print(f"  Tick size         : {tick_size}")
-    print(f"  ── Method-2 scorer ──────────────────────────────────────")
-    print(f"  volume_window     : {v2_params['volume_window']}")
-    print(f"  atr_window        : {v2_params['atr_window']}")
-    print(f"  baseline_window   : {v2_params['baseline_window']}")
-    print(f"  delta_z_threshold : {v2_params['delta_z_threshold']}")
-    print(f"  price_z_threshold : {v2_params['price_z_threshold']}")
-    print(f"  ── ATR labeling ─────────────────────────────────────────")
-    print(f"  atr_period        : {v2_params['atr_period']}")
-    print(f"  target_atr_mult   : {v2_params['target_atr_mult']}")
-    print(f"  stop_atr_mult     : {v2_params['stop_atr_mult']}")
-    print(f"  forward_days      : {v2_params['forward_days']}")
-    print(line)
+def _header(instrument, structure, product_code, timeframe, start_date, end_date,
+             params, tick_size, n_rows, combined_candle=1):
+    candle_label = f"{combined_candle}D rolling" if combined_candle > 1 else "1D"
+    print(f"\n{'─'*70}")
+    print(f"  {structure.upper()}  ▶  {instrument}  [{timeframe}  {candle_label}]  ({product_code})")
+    print(f"{'─'*70}")
+    print(f"  Data            : {start_date} → {end_date}  ({n_rows} bars)")
+    print(f"  Candle          : {candle_label}")
+    print(f"  Tick size       : {tick_size}")
+    print(f"  volume_window   : {params['volume_window']}")
+    print(f"  atr_window      : {params['atr_window']}")
+    print(f"  baseline_window : {params['baseline_window']}")
+    print(f"  atr_period      : {params['atr_period']}")
+    print(f"  target×stop     : {params['target_atr_mult']} / {params['stop_atr_mult']}")
+    print(f"  forward_days    : {params['forward_days']}")
+    print(f"{'─'*70}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN ENTRY POINT
+# PUBLIC ENTRY POINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_absorption_v2_threshold_analysis(
+def run_heatmap_analysis(
     product_code     : str,
-    timeframe        : str               = "1d",
-    months_back      : int               = 7,
+    months_back      : int               = 8,
+    front_n          : int               = FRONT_N,
+    combined_candle  : int               = 1,
+    delta_z_grid     : np.ndarray | None = None,
+    price_z_grid     : np.ndarray | None = None,
+    params           : dict | None       = None,
+    show_dist_plot   : bool              = True,
+    show_heatmap     : bool              = True,
+) -> dict:
+    """
+    Per-instrument z-score threshold heatmap + absorption score distribution.
+
+    One heatmap + one distribution plot per instrument.
+
+    Parameters
+    ----------
+    product_code    : e.g. "SM" or "BO"
+    months_back     : Calendar months of history to fetch.
+    front_n         : Front-N instruments per structure (spread + jumbo).
+    combined_candle : 1 = standard 1D bars (default).
+                      2 / 3 / 5 = rolling N-day candles with causal baseline
+                      anchored before the candle's first constituent bar.
+    delta_z_grid    : 1-D array of |z_delta| thresholds to test on the X-axis.
+                      Default: np.arange(1.0, 3.25, 0.25)
+    price_z_grid    : 1-D array of z_price thresholds to test on the Y-axis.
+                      Default: np.arange(0.5, -1.75, -0.25)
+    params          : Override any scorer / labeler param. Keys:
+                      volume_window, atr_window, baseline_window,
+                      atr_period, target_atr_mult, stop_atr_mult, forward_days.
+    show_dist_plot  : Display score distribution plots.
+    show_heatmap    : Display heatmap plots.
+
+    Returns
+    -------
+    dict keyed by instrument:
+        "df_scored"  : scored DataFrame
+        "df_buy"     : BUY-labeled DataFrame
+        "df_sell"    : SELL-labeled DataFrame
+        "heat_rate"  : numpy matrix of success rates
+        "annot"      : numpy matrix of annotations
+    """
+    p = dict(_DEFAULT_PARAMS)
+    if params:
+        p.update(params)
+
+    if delta_z_grid is None:
+        delta_z_grid = np.arange(1.0, 3.25, 0.25)
+    if price_z_grid is None:
+        price_z_grid = np.arange(0.5, -1.75, -0.25)
+
+    start        = _start_date(months_back)
+    end          = datetime.date.today().strftime("%Y-%m-%d")
+    tick         = PRODUCTS[product_code]["tick_size"]
+    candle_label = f"{combined_candle}D rolling" if combined_candle > 1 else "1D"
+    all_instruments = get_all_front_instruments(product_code, front_n=front_n)
+
+    results = {}
+
+    for structure, instruments in all_instruments.items():
+        print(f"\n{'#'*72}")
+        print(f"#  STRUCTURE : {structure.upper()}  —  {product_code}  [{candle_label}]")
+        print(f"{'#'*72}")
+
+        for inst in instruments:
+            _header(inst, structure, product_code, "1d", start, end, p, tick,
+                    n_rows=0, combined_candle=combined_candle)
+
+            df_scored, df_buy, df_sell = _fetch_score_label(
+                inst, product_code, start, end, p,
+                combined_candle=combined_candle)
+            if df_scored is None:
+                print(f"  [SKIP] {inst} — no data / scoring failed")
+                continue
+
+            print(f"  Bars fetched    : {len(df_scored)}")
+
+            # ── heatmap ───────────────────────────────────────────────────────
+            heat_rate, annot = _heatmap_matrices(
+                df_scored, df_buy, df_sell, delta_z_grid, price_z_grid)
+
+            if show_heatmap:
+                title = (f"{structure.upper()} ▶ {inst}  [{candle_label}]  |  "
+                         f"Absorption v2 Heatmap  (BUY+SELL pooled)")
+                fig_h = _plot_heatmap(heat_rate, annot, delta_z_grid,
+                                      price_z_grid, title, p)
+                plt.show(); plt.close(fig_h)
+
+            # ── distribution ──────────────────────────────────────────────────
+            if show_dist_plot:
+                title_d = (f"{structure.upper()} ▶ {inst}  [{candle_label}]  |  "
+                           f"Absorption Score Distribution")
+                fig_d   = _plot_distribution(df_scored, df_buy, df_sell, title_d)
+                plt.show(); plt.close(fig_d)
+
+            results[inst] = {
+                "df_scored" : df_scored,
+                "df_buy"    : df_buy,
+                "df_sell"   : df_sell,
+                "heat_rate" : heat_rate,
+                "annot"     : annot,
+            }
+
+    return results
+
+
+def run_heatmap_by_structure(
+    product_code     : str,
+    months_back      : int               = 8,
+    front_n          : int               = FRONT_N,
+    delta_z_grid     : np.ndarray | None = None,
+    price_z_grid     : np.ndarray | None = None,
+    params           : dict | None       = None,
+    show_dist_plot   : bool              = True,
+    show_heatmap     : bool              = True,
+) -> dict:
+    """
+    Same as run_heatmap_analysis() but pools all instruments within each
+    structure type (spread / jumbo) into a single heatmap.
+
+    Useful for seeing structure-level signal quality without per-instrument noise.
+
+    Returns
+    -------
+    dict keyed by structure name ("spread", "jumbo"):
+        "heat_rate"   : pooled success-rate matrix
+        "annot"       : pooled annotation matrix
+        "instruments" : list of instruments included
+    """
+    p = dict(_DEFAULT_PARAMS)
+    if params:
+        p.update(params)
+
+    if delta_z_grid is None:
+        delta_z_grid = np.arange(1.0, 3.25, 0.25)
+    if price_z_grid is None:
+        price_z_grid = np.arange(0.5, -1.75, -0.25)
+
+    start = _start_date(months_back)
+    end   = datetime.date.today().strftime("%Y-%m-%d")
+    all_instruments = get_all_front_instruments(product_code, front_n=front_n)
+
+    results = {}
+
+    for structure, instruments in all_instruments.items():
+        print(f"\n{'#'*72}")
+        print(f"#  POOLED HEATMAP — {structure.upper()}  ({product_code})")
+        print(f"{'#'*72}")
+
+        n_price = len(price_z_grid)
+        n_delta = len(delta_z_grid)
+
+        # accumulate successes/failures across instruments
+        pool_succ = np.zeros((n_price, n_delta))
+        pool_fail = np.zeros((n_price, n_delta))
+        pool_score_sum = np.zeros((n_price, n_delta))
+        pool_score_cnt = np.zeros((n_price, n_delta))
+        valid_instruments = []
+
+        for inst in instruments:
+            print(f"  Loading {inst}...")
+            df_scored, df_buy, df_sell = _fetch_score_label(
+                inst, product_code, start, end, p)
+            if df_scored is None:
+                print(f"    [SKIP]")
+                continue
+
+            valid_instruments.append(inst)
+            z_delta_col  = df_scored["z_delta"].values
+            z_price_col  = df_scored["z_price"].values
+            score_col    = df_scored["absorption_score"].values
+            buy_success  = df_buy["sl_success"].values
+            sell_success = df_sell["sl_success"].values
+
+            for i, pz in enumerate(price_z_grid):
+                for j, dz in enumerate(delta_z_grid):
+                    buy_mask  = (z_delta_col >= dz)  & (z_price_col <= pz)
+                    sell_mask = (z_delta_col <= -dz) & (z_price_col <= pz)
+
+                    pool_succ[i,j] += (
+                        np.nansum(buy_success[buy_mask]   == 1.0) +
+                        np.nansum(sell_success[sell_mask] == 1.0)
+                    )
+                    pool_fail[i,j] += (
+                        np.nansum(buy_success[buy_mask]   == 0.0) +
+                        np.nansum(sell_success[sell_mask] == 0.0)
+                    )
+                    comb = score_col[buy_mask | sell_mask]
+                    pool_score_sum[i,j] += np.nansum(comb)
+                    pool_score_cnt[i,j] += np.isfinite(comb).sum()
+
+        # build matrices
+        heat_rate    = np.full((n_price, n_delta), np.nan)
+        annot_labels = np.empty((n_price, n_delta), dtype=object)
+
+        for i in range(n_price):
+            for j in range(n_delta):
+                tot_valid = pool_succ[i,j] + pool_fail[i,j]
+                avg_score = (pool_score_sum[i,j] / pool_score_cnt[i,j]
+                             if pool_score_cnt[i,j] > 0 else np.nan)
+                if tot_valid > 0:
+                    heat_rate[i,j]    = pool_succ[i,j] / tot_valid
+                    annot_labels[i,j] = (
+                        f"S:{int(pool_succ[i,j])} F:{int(pool_fail[i,j])}\n"
+                        f"N:{int(tot_valid)} Avg:{avg_score:.2f}"
+                    )
+                else:
+                    heat_rate[i,j]    = np.nan
+                    annot_labels[i,j] = "N/A"
+
+        if show_heatmap:
+            title = (f"POOLED {structure.upper()}  |  {product_code}  "
+                     f"|  {len(valid_instruments)} instruments")
+            fig_h = _plot_heatmap(heat_rate, annot_labels, delta_z_grid,
+                                   price_z_grid, title, p)
+            plt.show(); plt.close(fig_h)
+
+        results[structure] = {
+            "heat_rate"   : heat_rate,
+            "annot"       : annot_labels,
+            "instruments" : valid_instruments,
+        }
+
+    return results
+
+
+def run_threshold_sweep(
+    product_code     : str,
+    months_back      : int               = 8,
+    front_n          : int               = FRONT_N,
     score_grid       : np.ndarray | None = None,
-    front_n          : int               = 5,
-    v2_params        : dict | None       = None,
+    params           : dict | None       = None,
     min_signal_count : int               = 8,
     n_bootstrap      : int               = 500,
     random_seed      : int               = 42,
     show_plots       : bool              = True,
-    hourly_df_map    : dict | None       = None,
 ) -> dict:
     """
-    Run Method-2 absorption threshold analysis for all front-N instruments.
+    Per-instrument absorption_score threshold sweep.
+
+    Sweeps the continuous absorption_score (not the z-thresholds) and
+    produces a Precision / Recall / F1 / MCC / Lift table for each instrument.
 
     Parameters
     ----------
-    product_code      : e.g. "BO" or "SM".
-    timeframe         : "1d" (daily OHLC) or "1h" (hourly OHLC).
-    months_back       : Calendar months of history to fetch.
-    score_grid        : Threshold grid for the sweep (default 0.05..0.95 step 0.05).
-    front_n           : Front-N spreads and jumbos each.
-    v2_params         : Override any Method-2 or ATR labeling param.
-                        Keys: volume_window, atr_window, baseline_window,
-                              delta_z_threshold, price_z_threshold,
-                              atr_period, target_atr_mult, stop_atr_mult,
-                              forward_days.
-    min_signal_count  : N < this is flagged yellow in the sweep table.
-    n_bootstrap       : Bootstrap replications for Precision CI.
-    random_seed       : RNG seed.
-    show_plots        : Display distribution plots inline.
-    hourly_df_map     : Optional {instrument: hourly_df} pre-loaded 1H data
-                        for same-bar ambiguity resolution in the ATR labeler
-                        (only relevant when timeframe="1d").
+    score_grid       : Thresholds to sweep. Default np.arange(0.05, 1.0, 0.05).
+    params           : Override scorer / labeler params.
+    min_signal_count : Rows with N < this are highlighted yellow.
+    n_bootstrap      : Bootstrap iterations for Precision CI.
+    random_seed      : RNG seed.
+    show_plots       : Display distribution plots.
 
     Returns
     -------
-    dict keyed by instrument string:
-        "labeled_df"   : fully labelled DataFrame
-        "sweep_table"  : threshold sweep DataFrame
-        "base_rate"    : success base rate
-        "pr_auc"       : PR-AUC
-        "v2_params"    : the params used for this run
+    dict keyed by instrument:
+        "sweep_table" : threshold DataFrame
+        "base_rate"   : float
+        "pr_auc"      : float
     """
-    # ── merge user params over defaults ───────────────────────────────────────
-    params = dict(_DEFAULT_V2_PARAMS)
-    if v2_params:
-        params.update(v2_params)
+    p = dict(_DEFAULT_PARAMS)
+    if params:
+        p.update(params)
 
-    # ── score grid ────────────────────────────────────────────────────────────
     if score_grid is None:
-        score_grid = np.round(np.arange(0.05, 1.00, 0.05), 3)
+        score_grid = np.round(np.arange(0.05, 1.0, 0.05), 3)
 
-    start_date = _months_back_start(months_back)
-    end_date   = datetime.date.today().strftime("%Y-%m-%d")
-    is_1h      = timeframe == "1h"
-    tick_size  = PRODUCTS[product_code]["tick_size"]
+    start = _start_date(months_back)
+    end   = datetime.date.today().strftime("%Y-%m-%d")
+    tick  = PRODUCTS[product_code]["tick_size"]
+    all_instruments = get_all_front_instruments(product_code, front_n=front_n)
 
-    all_instruments = get_all_front_instruments(
-        product_code = product_code,
-        front_n      = front_n,
-    )
-
-    results: dict[str, dict] = {}
+    results = {}
 
     for structure, instruments in all_instruments.items():
-        print(f"\n{'#' * 72}")
-        print(f"#  STRUCTURE : {structure.upper()}  —  {product_code}  [{timeframe}]  (Method 2)")
-        print(f"{'#' * 72}")
+        print(f"\n{'#'*72}")
+        print(f"#  STRUCTURE : {structure.upper()}  —  {product_code}  (threshold sweep)")
+        print(f"{'#'*72}")
 
-        for instrument in instruments:
+        for inst in instruments:
+            _header(inst, structure, product_code, "1d", start, end, p, tick, 0)
 
-            # ── 1. Fetch OHLC ─────────────────────────────────────────────────
-            if is_1h:
-                df_raw = fetch_ohlc_1h(
-                    instrument      = instrument,
-                    product_code    = product_code,
-                    getData_OHLC_v2 = getData_OHLC_v2,
-                    start_date      = start_date,
-                    end_date        = end_date,
-                )
-            else:
-                df_raw = fetch_ohlc_1d(
-                    instrument      = instrument,
-                    product_code    = product_code,
-                    getData_OHLC_v2 = getData_OHLC_v2,
-                    start_date      = start_date,
-                    end_date        = end_date,
-                )
-
-            if df_raw is None or len(df_raw) < 30:
-                nb = 0 if df_raw is None else len(df_raw)
-                print(f"\n  [SKIP] {instrument} — insufficient data ({nb} bars)")
+            df_scored, df_buy, df_sell = _fetch_score_label(
+                inst, product_code, start, end, p)
+            if df_scored is None:
+                print(f"  [SKIP] {inst}")
                 continue
 
-            _print_instrument_header(
-                instrument   = instrument,
-                structure    = structure,
-                product_code = product_code,
-                timeframe    = timeframe,
-                start_date   = start_date,
-                end_date     = end_date,
-                v2_params    = params,
-                tick_size    = tick_size,
-                n_rows       = len(df_raw),
-            )
-
-            # ── 2. Score — Method 2 ───────────────────────────────────────────
-            try:
-                df_scored = calculate_absorption_v2(
-                    df_raw,
-                    volume_window      = params["volume_window"],
-                    atr_window         = params["atr_window"],
-                    baseline_window    = params["baseline_window"],
-                    delta_z_threshold  = params["delta_z_threshold"],
-                    price_z_threshold  = params["price_z_threshold"],
-                )
-            except Exception as exc:
-                print(f"  [WARN] Scoring failed for {instrument}: {exc}")
-                continue
-
-            # ── 3. Label — ATR profit-first ───────────────────────────────────
-            h_df = (hourly_df_map or {}).get(instrument)
-
-            try:
-                df_labeled = label_absorption_atr(
-                    df_scored,
-                    atr_period      = params["atr_period"],
-                    target_atr_mult = params["target_atr_mult"],
-                    stop_atr_mult   = params["stop_atr_mult"],
-                    forward_days    = params["forward_days"],
-                    hourly_df       = h_df,
-                )
-            except Exception as exc:
-                print(f"  [WARN] Labeling failed for {instrument}: {exc}")
-                continue
-
-            # ── 4. Filter to directional rows only ────────────────────────────
-            df_labeled = df_labeled[
-                df_labeled["absorption_direction"].isin(["BUY", "SELL"])
-            ].dropna(subset=["absorption_score"]).copy()
-
-            success_col = "sl_success"
-
-            # ── 5. Outcome summary ────────────────────────────────────────────
-            valid_rows = df_labeled.dropna(subset=[success_col])
-            n_total    = len(df_labeled)
-            n_valid    = len(valid_rows)
-            n_succ     = int((valid_rows[success_col] == 1.0).sum())
-            n_fail     = int((valid_rows[success_col] == 0.0).sum())
-            n_amb      = int((df_labeled.get("outcome", pd.Series()) == "AMBIGUOUS").sum())
-            n_unres    = int((df_labeled.get("outcome", pd.Series()) == "UNRESOLVED").sum())
-
-            print(f"\n  Total directional bars  : {n_total}")
-            print(f"  Valid (non-NaN success) : {n_valid}")
-            print(f"  ├── Success   (1)       : {n_succ}"
-                  + (f"   ({100*n_succ/n_valid:.1f}%)" if n_valid else ""))
-            print(f"  ├── Failure   (0)       : {n_fail}"
-                  + (f"   ({100*n_fail/n_valid:.1f}%)" if n_valid else ""))
-            print(f"  ├── Ambiguous (NaN)     : {n_amb}")
-            print(f"  └── Unresolved (NaN)    : {n_unres}")
-
-            if n_valid == 0:
-                print("  [SKIP] No valid labelled rows.")
-                continue
-
-            # direction breakdown
+            # direction summary
+            real_dir = df_scored["absorption_direction"]
             for d in ("BUY", "SELL"):
-                sub = df_labeled[
-                    df_labeled["absorption_direction"] == d
-                ].dropna(subset=[success_col])
+                sub = df_scored[real_dir == d]
                 if len(sub):
-                    sr = float((sub[success_col] == 1.0).mean())
-                    print(f"  {d:<4} valid={len(sub)}  success_rate={sr:.3f}")
+                    out = (df_buy if d == "BUY" else df_sell)
+                    suc = (out.loc[real_dir == d, "sl_success"] == 1.0).sum()
+                    tot = out.loc[real_dir == d, "sl_success"].notna().sum()
+                    print(f"  {d:<4}  directional bars={len(sub)}  "
+                          f"valid outcomes={tot}  "
+                          f"success_rate={suc/tot:.3f}" if tot else
+                          f"  {d:<4}  directional bars={len(sub)}  valid=0")
 
-            # ── 6. Threshold sweep ────────────────────────────────────────────
-            sweep, base_rate = _make_threshold_table(
-                labeled_df   = df_labeled,
-                score_col    = "absorption_score",
-                success_col  = success_col,
-                score_grid   = score_grid,
-                min_n        = min_signal_count,
-                n_bootstrap  = n_bootstrap,
-                random_seed  = random_seed,
-                forward_bars = params["forward_days"],
+            # sweep
+            sweep, base_rate = _make_sweep_table(
+                df_scored, df_buy, df_sell,
+                score_grid, min_signal_count, n_bootstrap, random_seed,
+                p["forward_days"],
             )
+            auc_val = _pr_auc(df_scored, df_buy, df_sell)
 
-            auc_val = _pr_auc(df_labeled, "absorption_score", success_col)
+            br_str  = f"{base_rate:.3f}" if np.isfinite(base_rate) else "n/a"
+            auc_str = f"{auc_val:.3f}"   if np.isfinite(auc_val)   else "n/a"
+            print(f"\n  Threshold sweep  (base={br_str}  PR-AUC={auc_str})")
 
-            br_str = f"{base_rate:.3f}" if np.isfinite(base_rate) else "n/a"
-            auc_str = f"{auc_val:.3f}"  if np.isfinite(auc_val) else "n/a"
-            print(f"\n  ── Combined BUY + SELL sweep  "
-                  f"(base rate={br_str}  PR-AUC={auc_str})")
-
-            if sweep.empty:
-                print("  No valid labelled rows for sweep.")
-            else:
+            if not sweep.empty:
                 caption = (
-                    f"{instrument}  [{timeframe}]  Method 2  "
-                    f"|  Δz≥{params['delta_z_threshold']}  Pz≤{params['price_z_threshold']}  "
-                    f"|  ATR×{params['target_atr_mult']}/×{params['stop_atr_mult']}  "
-                    f"|  fwd={params['forward_days']}d  "
-                    f"|  months={months_back}  |  base={br_str}  "
-                    f"|  Yellow=N<{min_signal_count}"
+                    f"{inst}  |  "
+                    f"Δz_thresh=dummy  Pz_thresh=dummy  |  "
+                    f"ATR×{p['target_atr_mult']}/×{p['stop_atr_mult']}  "
+                    f"fwd={p['forward_days']}d  months={months_back}  "
+                    f"base={br_str}  Yellow=N<{min_signal_count}"
                 )
-                display(_styled_table(sweep, caption))
+                display(_styled_sweep_table(sweep, caption))
 
-            # ── 7. Distribution plot ──────────────────────────────────────────
-            if show_plots and not sweep.empty:
-                fig = _distribution_plot(
-                    labeled_df  = df_labeled,
-                    score_col   = "absorption_score",
-                    success_col = success_col,
-                    instrument  = instrument,
-                    timeframe   = timeframe,
-                    v2_params   = params,
-                )
-                plt.show()
-                plt.close(fig)
+            if show_plots:
+                title_d = f"{structure.upper()} ▶ {inst}  |  Absorption Score Distribution"
+                fig_d   = _plot_distribution(df_scored, df_buy, df_sell, title_d)
+                plt.show(); plt.close(fig_d)
 
-            results[instrument] = {
-                "labeled_df"  : df_labeled,
+            results[inst] = {
                 "sweep_table" : sweep,
                 "base_rate"   : base_rate,
                 "pr_auc"      : auc_val,
-                "v2_params"   : dict(params),
             }
 
-    print(f"\n{'═'*70}")
-    print(f"  ABSORPTION V2 COMPLETE  ▸  {product_code}  [{timeframe}]  "
-          f"▸  {len(results)} instrument(s)")
-    print(f"{'═'*70}")
     return results
