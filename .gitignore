@@ -9,4 +9,4 @@ data/*
 !data/ohlc.py
 
 # Ignore files inside excel folder
-excel/*
+excels/*
