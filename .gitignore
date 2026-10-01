@@ -7,3 +7,6 @@ data/*
 
 # But track this file
 !data/ohlc.py
+
+# Ignore files inside excel folder
+excel/*
