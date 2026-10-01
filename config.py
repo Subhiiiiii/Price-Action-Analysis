@@ -223,3 +223,23 @@ PVD: dict = {
     #                      ≈ trend did not reverse, so we were right).
     "exhaustion_merge_unresolved" : True,
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPRESSION — ATR-BASED LABELING
+# success = max |Close[t+i] - Close[t]|, i=1..forward_days  >  k_atr × ATR[t]
+# Scoring params (range_baseline, atr_period, ...) still come from COMPRESSION.
+# ─────────────────────────────────────────────────────────────────────────────
+COMPRESSION_ATR: dict = {
+    "label_atr_period"       : 10,     # bars used for ATR[t] (on the candle series)
+    "k_atr"                  : 1.0,    # required move = k_atr × ATR
+    "forward_days"           : 10,
+    # continuation: next `lookahead` bars also have score >= threshold
+    "continuation_lookahead" : 1,
+    "continuation_threshold" : None,   # None -> COMPRESSION["compression_threshold"]
+    # "exclude" | "as_success" | "as_failure" | "ignore"
+    "continuation_mode"      : "exclude",
+    # sweep
+    "min_signal_count"       : 8,
+    "n_bootstrap"            : 500,
+    "random_seed"            : 42,
+}

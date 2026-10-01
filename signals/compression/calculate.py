@@ -51,6 +51,7 @@ def calculate_compression(
     persistence_window: int = 20,
     compression_threshold: float = 0.60,
     epsilon: float = 1e-9,
+    label_atr_period: int = 10,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Calculate the causal four-component compression score.
@@ -90,6 +91,12 @@ def calculate_compression(
     data["atr"] = data["true_range"].rolling(
         atr_period, min_periods=max(2, atr_period // 2)
     ).mean()
+
+        # ATR used ONLY for outcome labeling (causal: includes bar t, nothing after)
+    data["atr_label"] = data["true_range"].rolling(
+        label_atr_period, min_periods=max(3, label_atr_period // 2)
+    ).mean()
+    
     atr_z = _robust_zscore(np.log1p(data["atr"]), range_baseline, min_periods, epsilon)
     data["atr_component"] = np.clip(-atr_z / 2.5, 0.0, 1.0)
 
