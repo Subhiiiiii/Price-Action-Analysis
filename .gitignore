@@ -5,8 +5,13 @@ __pycache__/
 # Ignore everything inside data/
 data/*
 
-# But track this file
+# But track these files
 !data/ohlc.py
+!data/liquidity.py
 
 # Ignore files inside excel folder
 excels/*
+
+# Ignore generated output files
+output/*
+combined_signal_analysis/outputs/*

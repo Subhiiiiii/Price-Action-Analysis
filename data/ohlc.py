@@ -16,7 +16,7 @@ import pandas as pd
 
 from ..config import (
     DATA_DIR, CLEAN_PREVIOUS_DATA, OHLC_START_DATE, OHLC_END_DATE,
-    PRODUCTS, HORIZON_BARS, HORIZON_BARS_1H, HOURLY_SESSION_GAP, API_TOKEN,
+    PRODUCTS, HORIZON_BARS, HORIZON_BARS_1H, HOURLY_SESSION_GAP,
 )
 
 
@@ -27,12 +27,66 @@ def _date_to_unix(date_string: str) -> int:
     return int(dt.timestamp())
 
 
+class OHLCFetchError(RuntimeError):
+    """Expose HTTP status for callers without exposing authentication headers."""
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def fetch_ohlc_from_db(
+    instrs: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame | None:
+    """
+    Fetch OHLC daily volume data directly from PostgreSQL database (fundamentals_data).
+    Used for softs spreads and outrights.
+    """
+    try:
+        import psycopg2
+        from .. import config as current_config
+        db_cfg = getattr(current_config, "DB_CONFIG", None)
+        if not db_cfg:
+            return None
+
+        conn = psycopg2.connect(**db_cfg)
+        table = (
+            "fundamentals_data.spreads_daily_volumes"
+            if "-" in instrs
+            else "fundamentals_data.outrights_daily_volumes"
+        )
+        query = f"""
+            SELECT trade_date as "Date", open, high, low, close, volume, 
+                   buy_volume as buyvolume, sell_volume as sellvolume
+            FROM {table}
+            WHERE qh_code = %s AND trade_date >= %s AND trade_date <= %s
+            ORDER BY trade_date ASC;
+        """
+        df = pd.read_sql(query, conn, params=(instrs, start_date, end_date))
+        conn.close()
+
+        if df.empty:
+            return None
+
+        df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+        for col in ["open", "high", "low", "close", "volume", "buyvolume", "sellvolume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        return df.sort_values("Date").reset_index(drop=True)
+    except Exception as exc:
+        print(f"  [DB NOTICE] DB query for {instrs} skipped: {exc}")
+        return None
+
+
 def getData_OHLC_v2(
     instrs: str,
     start_date: str,
     end_date: str,
     timeinterval: str = "1D",
     token: str | None = None,
+    raise_on_error: bool = False,
+    timeout: float = 60,
 ) -> pd.DataFrame | None:
     """
     Fetch OHLC bars from the internal QH API.
@@ -44,11 +98,19 @@ def getData_OHLC_v2(
       Date, open, high, low, close, volume, buyvolume, sellvolume
     or None on error.
     """
+    # Check PostgreSQL DB first (primary for softs spreads and outrights)
+    if timeinterval.upper() == "1D":
+        db_df = fetch_ohlc_from_db(instrs, start_date, end_date)
+        if db_df is not None and not db_df.empty:
+            return db_df
     import requests
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    _token = token or API_TOKEN
+    # Config can be reloaded/edited in a running notebook. Never keep a stale
+    # import-time token; callers may also provide an explicit token override.
+    from .. import config as current_config
+    _token = current_config.API_TOKEN if token is None else token
     if not _token or _token == "PASTE_YOUR_TOKEN_HERE":
         raise ValueError(
             "API token not set. Edit API_TOKEN in market_analysis/config.py"
@@ -66,9 +128,11 @@ def getData_OHLC_v2(
         f"&extraFields=buyvolume%2Csellvolume"
     )
 
-    r = requests.get(url, headers={"Authorization": f"Bearer {_token}"}, verify=False)
+    r = requests.get(url, headers={"Authorization": f"Bearer {_token}"}, verify=False, timeout=timeout)
 
     if r.status_code != 200:
+        if raise_on_error:
+            raise OHLCFetchError(f"OHLC API HTTP {r.status_code} for {instrs}", r.status_code)
         print(f"  [API ERROR] {r.status_code} for {instrs}: {r.text[:200]}")
         return None
 
@@ -76,6 +140,8 @@ def getData_OHLC_v2(
     d    = resp.get("data", resp) if isinstance(resp, dict) else resp
 
     if not d:
+        if raise_on_error:
+            return pd.DataFrame(columns=["Date", "open", "high", "low", "close", "volume", "buyvolume", "sellvolume"])
         print(f"  [WARN] Empty API response for {instrs}")
         return None
 
@@ -101,6 +167,123 @@ def _cache_path(product_code: str, instrument: str) -> Path:
     folder = DATA_DIR / product_code.lower()
     folder.mkdir(parents=True, exist_ok=True)
     return folder / f"{instrument}_1d.csv"
+
+
+def _normalize_daily_data(frame: pd.DataFrame) -> pd.DataFrame:
+    """Validate one daily cache/API slice; retain the latest duplicate date."""
+    columns = ["Date", "open", "high", "low", "close", "volume", "buyvolume", "sellvolume"]
+    data = frame.copy()
+    data.columns = ["Date" if str(c).lower() == "date" else str(c).lower() for c in data.columns]
+    if not set(columns).issubset(data.columns):
+        raise ValueError(f"OHLC missing columns: {set(columns) - set(data.columns)}")
+    data = data[columns].copy()
+    data["Date"] = pd.to_datetime(data["Date"], utc=True, errors="raise").dt.normalize()
+    for name in columns[1:]:
+        data[name] = pd.to_numeric(data[name], errors="raise")
+    if data.Date.isna().any() or not np.isfinite(data[columns[1:]].to_numpy(dtype=float)).all():
+        raise ValueError("OHLC contains missing/nonfinite values")
+    invalid = (data.high < data[["open", "close", "low"]].max(axis=1)) | (data.low > data[["open", "close", "high"]].min(axis=1))
+    if invalid.any() or (data[["volume", "buyvolume", "sellvolume"]] < 0).any().any():
+        raise ValueError("OHLC contains invalid candle/volume values")
+    return data.drop_duplicates("Date", keep="last").sort_values("Date").reset_index(drop=True)
+
+
+def fetch_ohlc_1d_incremental(
+    instrument: str, product_code: str, start_date, end_date,
+    fetcher=None, cache_dir: str | Path | None = None,
+    allow_cached_on_fetch_error: bool = True,
+) -> tuple[pd.DataFrame, dict]:
+    """Use cached daily bars; fetch only missing leading/trailing ranges.
+
+    start_date/end_date are inclusive completed-bar bounds. API requests use
+    [start, end-exclusive), e.g. Oct6 -> Oct7 fetches the missing Oct6 bar.
+    Weekends do not trigger tail fetches; no exchange-holiday/internal-gap
+    completeness is claimed. Existing cache history is preserved, and atomic
+    replacement occurs only after a successful nonempty missing-range fetch.
+    On failure a usable cache may still support analysis, with explicit stale
+    coverage metadata. Set allow_cached_on_fetch_error=False for strict runs.
+    """
+    from .. import config as current_config
+    from ..utils.contracts import instrument_to_api_str
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
+    end = end.tz_localize("UTC") if end.tzinfo is None else end.tz_convert("UTC")
+    start, end = start.normalize(), end.normalize()
+    target = pd.offsets.BDay().rollback(end)  # known weekends only
+    if target < start:
+        raise ValueError("No weekday in requested OHLC window")
+    base = current_config.DATA_DIR if cache_dir is None else Path(cache_dir)
+    cache = Path(base) / product_code.lower() / f"{instrument}_1d.csv"
+    columns = ["Date", "open", "high", "low", "close", "volume", "buyvolume", "sellvolume"]
+    original = _normalize_daily_data(pd.read_csv(cache)) if cache.exists() else pd.DataFrame(columns=columns)
+    usable = original.loc[original.Date.between(start, target)] if not original.empty else original.copy()
+    ranges = []
+    if usable.empty:
+        ranges.append((start, target + pd.Timedelta(days=1)))
+    else:
+        # Old history before start already covers the left boundary. The first
+        # in-range row may be later because of a holiday/no trades, not a missing
+        # historical cache prefix.
+        first, last = original.Date.min(), usable.Date.max()
+        if first > start and len(pd.bdate_range(start, first - pd.Timedelta(days=1))):
+            ranges.append((start, first))
+        if last < target:
+            ranges.append((last + pd.Timedelta(days=1), target + pd.Timedelta(days=1)))
+    pieces, statuses, warnings = [original], [], []
+    new_dates = set()
+    for left, right in ranges:
+        print(f"  [FETCH MISSING] {instrument}: {left.date()} -> {right.date()} (end exclusive)", flush=True)
+        try:
+            if fetcher is None:
+                fresh = getData_OHLC_v2(instrs=instrument_to_api_str(instrument),
+                    start_date=left.strftime("%Y-%m-%d"), end_date=right.strftime("%Y-%m-%d"),
+                    timeinterval="1D", token=current_config.API_TOKEN, raise_on_error=True)
+            else:
+                fresh = fetcher(instrs=instrument_to_api_str(instrument), start_date=left.strftime("%Y-%m-%d"),
+                                end_date=right.strftime("%Y-%m-%d"), timeinterval="1D")
+            if fresh is None:
+                raise OHLCFetchError("OHLC API returned no usable response")
+            if fresh.empty:
+                statuses.append("empty_response")
+                warnings.append(f"API returned no bars for {left.date()} -> {right.date()}")
+                continue
+            fresh = _normalize_daily_data(fresh)
+            fresh = fresh.loc[(fresh.Date >= left) & (fresh.Date < right)]
+            if fresh.empty:
+                statuses.append("empty_response")
+                warnings.append("API returned no completed bars inside requested missing range")
+                continue
+            new_dates.update(set(fresh.Date) - set(original.Date))
+            pieces.append(fresh)
+            statuses.append("fetched")
+        except (ValueError, OSError, RuntimeError) as exc:
+            if not allow_cached_on_fetch_error or usable.empty:
+                raise
+            statuses.append("fetch_failed_using_cache")
+            warnings.append(str(exc))
+            print(f"  [CACHE WARNING] {instrument}: {exc}; retaining saved bars", flush=True)
+    merged = _normalize_daily_data(pd.concat(pieces, ignore_index=True)) if len(pieces) > 1 else original
+    if len(pieces) > 1:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache.with_suffix(".csv.tmp")
+        merged.to_csv(temporary, index=False, encoding="utf-8-sig")
+        temporary.replace(cache)
+    data = merged.loc[merged.Date.between(start, target)].reset_index(drop=True)
+    if data.empty:
+        raise ValueError(f"{instrument}: no cached/fetched bars inside requested range")
+    reached = data.Date.max() >= target
+    if not reached:
+        warnings.append(f"Wanted completed data through {target.date()}; available through {data.Date.max().date()}")
+    if not ranges:
+        print(f"  [CACHE OK] {instrument}: latest completed bar {data.Date.max().date()}; no API call", flush=True)
+    return data, {"cache_path": str(cache), "requested_start": start, "requested_end": end,
+                  "target_weekday_end": target, "actual_start": data.Date.min(), "actual_end": data.Date.max(),
+                  "target_date_reached": bool(reached), "api_requests": len(ranges), "new_dates": len(new_dates),
+                  "fetch_status": "; ".join(statuses) if statuses else "cache_only",
+                  "cache_fallback_used": "fetch_failed_using_cache" in statuses,
+                  "coverage_warning": "; ".join(warnings),
+                  "coverage_basis": "cached bars plus missing-range API updates; internal gaps/exchange holidays unverified"}
 
 
 def _clean_product_cache(product_code: str) -> None:
@@ -171,7 +354,7 @@ def fetch_ohlc_1d(
     from ..utils.contracts import instrument_to_api_str
     api_str = instrument_to_api_str(instrument)
 
-    print(f"  [FETCH] {api_str}  {start_date} → {end_date}")
+    print(f"  [FETCH] {api_str}  {start_date} -> {end_date}")
     raw = getData_OHLC_v2(
         instrs     = api_str,
         start_date = start_date,
@@ -269,7 +452,7 @@ def _aggregate_trailing_1h(
     Build trailing n-bar OHLC from sorted 1H bars, respecting session breaks.
 
     A session break is detected when the time gap between consecutive bars
-    exceeds `session_gap` (default 4 hours — catches Fri-close→Mon-open gaps).
+    exceeds `session_gap` (default 4 hours — catches Fri-close->Mon-open gaps).
     When a window of n bars would span a session break the row is omitted
     (set open/high/low/close to NaN) rather than blending overnight/weekend
     prices.  This avoids spurious signals at session opens.
@@ -354,7 +537,7 @@ def fetch_ohlc_1h(
     from ..utils.contracts import instrument_to_api_str
     api_str = instrument_to_api_str(instrument)
 
-    print(f"  [FETCH 1H] {api_str}  {start_date} → {end_date}")
+    print(f"  [FETCH 1H] {api_str}  {start_date} -> {end_date}")
     raw = getData_OHLC_v2(
         instrs      = api_str,
         start_date  = start_date,

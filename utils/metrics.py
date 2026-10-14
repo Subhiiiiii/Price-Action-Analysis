@@ -11,24 +11,47 @@ import pandas as pd
 from sklearn.metrics import matthews_corrcoef, precision_recall_curve, auc as sk_auc
 
 
-# ── bootstrap CI ─────────────────────────────────────────────────────────────
+# ── Wilson Score Confidence Interval ──────────────────────────────────────────
+
+def wilson_score_interval(tp: int, total: int, confidence: float = 0.95) -> tuple[float, float]:
+    """
+    Wilson score confidence interval for binomial proportion (Precision = TP / total).
+    Statistically validated for small N and proportions near boundaries (0 or 1).
+    """
+    if total <= 0:
+        return (np.nan, np.nan)
+    # z = 1.95996 for 95% confidence
+    z = 1.959963984540054
+    p_hat = float(tp) / float(total)
+    denom = 1.0 + (z**2) / total
+    center = (p_hat + (z**2) / (2.0 * total)) / denom
+    radicand = (p_hat * (1.0 - p_hat) / total) + (z**2) / (4.0 * total**2)
+    half_width = (z / denom) * np.sqrt(max(0.0, radicand))
+    lower = max(0.0, center - half_width)
+    upper = min(1.0, center + half_width)
+    return (float(lower), float(upper))
+
+
+# ── Block Bootstrap CI ────────────────────────────────────────────────────────
 
 def _block_bootstrap_ci(
     signals: np.ndarray,
     labels: np.ndarray,
-    n_boot: int,
-    block_len: int,
-    seed: int,
+    n_boot: int = 500,
+    block_len: int = 11,
+    seed: int = 42,
 ) -> tuple[float, float]:
-    """Block-bootstrap 95% CI on Precision (positional indexing, no OOB)."""
+    """Block-bootstrap 95% CI on Precision, accounting for serial autocorrelation."""
     rng    = np.random.default_rng(seed)
     valid  = ~pd.isna(np.asarray(labels))
     sv     = np.asarray(signals)[valid].astype(bool)
     lv     = np.asarray(labels)[valid]
     n      = len(sv)
-    if n == 0:
+    if n == 0 or sv.sum() == 0:
         return (np.nan, np.nan)
+
     precs    = []
+    block_len = max(1, min(block_len, n))
     n_blocks = int(np.ceil(n / block_len))
     for _ in range(n_boot):
         pos = []
@@ -36,10 +59,12 @@ def _block_bootstrap_ci(
             s = rng.integers(0, max(1, n - block_len + 1))
             pos.extend(range(s, min(s + block_len, n)))
         pos = pos[:n]
-        sv_ = sv[pos]; lv_ = lv[pos]; ns = sv_.sum()
+        sv_ = sv[pos]
+        lv_ = lv[pos]
+        ns = sv_.sum()
         if ns > 0:
             precs.append((sv_ & (lv_ == 1)).sum() / ns)
-    if not precs:
+    if len(precs) < 10:
         return (np.nan, np.nan)
     return float(np.percentile(precs, 2.5)), float(np.percentile(precs, 97.5))
 
@@ -113,19 +138,23 @@ def threshold_sweep(
             mcc = np.nan
 
         ci     = _block_bootstrap_ci(sig, labels_arr, n_boot, block_len, seed)
-        ci_str = f"[{ci[0]:.3f}, {ci[1]:.3f}]" if ci[0]==ci[0] else "n/a"
+        ci_str = f"[{ci[0]:.3f}, {ci[1]:.3f}]" if np.isfinite(ci[0]) else "n/a"
+
+        wilson = wilson_score_interval(tp, ns, 0.95)
+        wilson_str = f"[{wilson[0]:.3f}, {wilson[1]:.3f}]" if np.isfinite(wilson[0]) else "n/a"
 
         rows.append({
-            "Threshold"  : T,
-            "N"          : ns,
-            "Precision"  : prec,
-            "Prec CI 95%": ci_str,
-            "Recall"     : rec,
-            "F1"         : f1,
-            "MCC"        : mcc,
-            "Lift"       : lift,
+            "Threshold"    : T,
+            "N"            : ns,
+            "Precision"    : prec,
+            "Prec CI 95%"  : ci_str,
+            "Wilson CI 95%": wilson_str,
+            "Recall"       : rec,
+            "F1"           : f1,
+            "MCC"          : mcc,
+            "Lift"         : lift,
             "TP": tp, "FP": fp, "FN": fn, "TN": tn,
-            "Low N"      : ns < min_n,
+            "Low N"        : ns < min_n,
         })
 
     return pd.DataFrame(rows), base_rate

@@ -57,7 +57,8 @@ from market_analysis.utils.contracts import get_all_front_instruments
 from market_analysis.data.ohlc import fetch_ohlc_1d, getData_OHLC_v2
 from market_analysis.signals.compression.calculate import calculate_compression
 from market_analysis.signals.compression.label     import label_compression
-from market_analysis.utils.metrics import _block_bootstrap_ci
+from market_analysis.utils.metrics import _block_bootstrap_ci, wilson_score_interval
+from market_analysis.data.liquidity import qualify_instrument_liquidity, style_liquidity_table
 
 # -- colours ------------------------------------------------------------------
 _C_SUCCESS = "seagreen"
@@ -82,6 +83,35 @@ def _months_back_start(months: int) -> str:
 # THRESHOLD SWEEP TABLE
 # =============================================================================
 
+def _collapse_to_episodes(
+    sig: np.ndarray,
+    mode: str = "first_bar",
+    min_gap: int = 1,
+) -> np.ndarray:
+    """
+    Handle overlapping forward windows by collapsing contiguous compression runs.
+
+    Modes:
+      - 'first_bar': Trigger signal only on the entry/first day of each compression run.
+      - 'non_overlapping': Enforce at least `min_gap` (forward_days) bars between signals.
+      - 'all_bars': Retain all individual bar triggers.
+    """
+    if mode == "all_bars":
+        return sig.copy()
+
+    n = len(sig)
+    ep_sig = np.zeros(n, dtype=bool)
+    gap = min_gap if mode == "non_overlapping" else 1
+    last_trigger = -gap - 1
+
+    for i in range(n):
+        if sig[i]:
+            if (i - last_trigger) > gap:
+                ep_sig[i] = True
+                last_trigger = i
+    return ep_sig
+
+
 def _make_threshold_table(
     labeled_df  : pd.DataFrame,
     score_col   : str,
@@ -91,11 +121,16 @@ def _make_threshold_table(
     n_bootstrap : int   = 500,
     random_seed : int   = 42,
     forward_days: int   = 10,
+    episode_mode: str   = "first_bar",
 ) -> tuple[pd.DataFrame, float]:
     """
     Sweep score_grid and return (table_df, base_rate).
 
-    Rows with NaN success_col (censored horizon) are excluded from the sweep.
+    Priority 2 Fix: Rows with zero scores are fully included in evaluating
+    negative signals, specificity, true base rate, and lift.
+    Priority 3 Fix: Clustered compression signals with overlapping forward windows
+    are handled via episode collapsing (`episode_mode='first_bar'`).
+    Priority 4 Fix: Wilson 95% Confidence Interval included as supplementary check.
     """
     valid = labeled_df.dropna(subset=[success_col]).reset_index(drop=True)
     if len(valid) == 0:
@@ -108,7 +143,9 @@ def _make_threshold_table(
 
     rows = []
     for T in score_grid:
-        sig = scores_arr >= T
+        sig_raw = scores_arr >= T
+        # Handle overlapping windows / compression episodes
+        sig = _collapse_to_episodes(sig_raw, mode=episode_mode, min_gap=forward_days)
         lab = labels_arr.astype(int)
 
         tp  = int(( sig & (lab == 1)).sum())
@@ -116,6 +153,7 @@ def _make_threshold_table(
         fn  = int((~sig & (lab == 1)).sum())
         tn  = int((~sig & (lab == 0)).sum())
         ns  = tp + fp
+        raw_bars = int(sig_raw.sum())
 
         prec = tp / ns          if ns > 0               else np.nan
         rec  = tp / (tp + fn)   if (tp + fn) > 0        else np.nan
@@ -135,17 +173,23 @@ def _make_threshold_table(
         ci_str = (f"[{ci[0]:.3f}, {ci[1]:.3f}]"
                   if np.isfinite(ci[0]) else "n/a")
 
+        wilson = wilson_score_interval(tp, ns, 0.95)
+        wilson_str = (f"[{wilson[0]:.3f}, {wilson[1]:.3f}]"
+                      if np.isfinite(wilson[0]) else "n/a")
+
         rows.append({
-            "Threshold"   : round(T, 3),
-            "N"           : ns,
-            "Precision"   : prec,
-            "Prec CI 95%" : ci_str,
-            "Recall"      : rec,
-            "F1"          : f1,
-            "MCC"         : mcc,
-            "Lift"        : lift,
+            "Threshold"    : round(T, 3),
+            "N"            : ns,
+            "N (raw bars)" : raw_bars,
+            "Precision"    : prec,
+            "Prec CI (Boot)": ci_str,
+            "Wilson CI 95%": wilson_str,
+            "Recall"       : rec,
+            "F1"           : f1,
+            "MCC"          : mcc,
+            "Lift"         : lift,
             "TP": tp, "FP": fp, "FN": fn, "TN": tn,
-            "Low N"       : ns < min_n,
+            "Low N"        : ns < min_n,
         })
 
     return pd.DataFrame(rows), base_rate
@@ -302,39 +346,50 @@ def _print_instrument_header(
 # =============================================================================
 
 def run_compression_threshold_analysis(
-    product_code     : str,
-    months_back      : int               = 9,
-    score_grid       : "np.ndarray|None" = None,
-    front_n          : int               = 5,
-    min_signal_count : int               = 8,
-    n_bootstrap      : int               = 500,
-    random_seed      : int               = 42,
-    show_plots       : bool              = True,
+    product_code          : str,
+    months_back           : int               = 9,
+    score_grid            : "np.ndarray|None" = None,
+    front_n               : int               = 5,    # Pipeline tracking universe
+    analytical_front_n    : int               = 2,    # Analytical universe (Front-2 for softs)
+    require_eligible      : bool              = True, # Enforce liquidity qualification
+    include_monitor       : bool              = False,# Include MONITOR contracts in sweep
+    episode_mode          : str               = "first_bar", # Priority 3: Resolve forward window overlap
+    min_signal_count      : int               = 8,
+    n_bootstrap           : int               = 500,
+    random_seed           : int               = 42,
+    show_plots            : bool              = True,
 ) -> dict[str, dict]:
     """
-    Run compression score threshold analysis for all front-N spreads and jumbos.
+    Run compression score threshold analysis for front spreads and jumbos.
+
+    Phase 1 & Phase 2 Enhancements:
+      - Sets Front-2 as the default analytical universe for soft commodities.
+      - Retains Front-3 to Front-5 in the data pipeline for monitoring.
+      - Validates actual liquidity of each spread via the Liquidity Qualification Layer
+        (20d median volume, relative volume, zero-volume days).
+      - Classifies into ELIGIBLE, MONITOR, ILLIQUID.
+      - Resolves overlapping forward windows via `episode_mode='first_bar'`.
+      - Includes zero-score days for robust true base rate and lift calculation.
+      - Evaluates both Bootstrap and Wilson 95% Confidence Intervals.
 
     Parameters
     ----------
-    product_code     : e.g. "SM"
-    months_back      : How many calendar months of history to pull.
-    score_grid       : Array of compression_score thresholds to sweep,
-                       e.g. np.arange(0.10, 1.0, 0.05).
-                       Defaults to values in config.COMPRESSION.
-    front_n          : Number of spreads and jumbos each  (default 5).
-    min_signal_count : N below this is flagged "Low N" (yellow) in the table.
-    n_bootstrap      : Bootstrap replications for Precision CI.
-    random_seed      : RNG seed.
-    show_plots       : Display distribution plots inline.
+    product_code          : e.g. "SB", "KC", "CC", "CT", "RC", "SM"
+    months_back           : Calendar months of history to pull.
+    score_grid            : Array of compression_score thresholds to sweep.
+    front_n               : Total pipeline universe size (default 5).
+    analytical_front_n    : Analytical universe depth (default 2 for softs).
+    require_eligible      : If True, only sweeps ELIGIBLE (and opt-in MONITOR) contracts.
+    include_monitor       : If True, sweeps MONITOR contracts in addition to ELIGIBLE.
+    episode_mode          : 'first_bar' (default), 'non_overlapping', or 'all_bars'.
+    min_signal_count      : N below this is flagged "Low N" (yellow) in table.
+    n_bootstrap           : Bootstrap replications for Precision CI.
+    random_seed           : RNG seed.
+    show_plots            : Display distribution plots inline.
 
     Returns
     -------
-    dict keyed by instrument string, each value is:
-        {
-            "labeled_df"  : pd.DataFrame,   # fully labelled OHLC
-            "sweep_table" : pd.DataFrame,   # threshold sweep results
-            "base_rate"   : float,          # success base rate
-        }
+    dict keyed by instrument string (plus "_liquidity_matrix" summary DataFrame).
     """
     if score_grid is None:
         score_grid = np.round(
@@ -359,15 +414,18 @@ def run_compression_threshold_analysis(
     )
 
     results: dict[str, dict] = {}
+    liquidity_rows: list[dict] = []
 
     for structure, instruments in all_instruments.items():
         print(f"\n{'#' * 72}")
         print(f"#  STRUCTURE : {structure.upper()}  --  {product_code}")
+        print(f"#  Analytical Universe: Front-{analytical_front_n}  |  Pipeline: Front-{front_n}")
         print(f"{'#' * 72}")
 
-        for instrument in instruments:
-
-            # 1. Fetch 1D OHLC
+        # ── Pre-fetch & Liquidity Qualification for all front_n instruments ──
+        raw_cache: dict[str, pd.DataFrame | None] = {}
+        qual_cache: dict[str, dict] = {}
+        for rank, instrument in enumerate(instruments, 1):
             df_raw = fetch_ohlc_1d(
                 instrument      = instrument,
                 product_code    = product_code,
@@ -375,8 +433,44 @@ def run_compression_threshold_analysis(
                 start_date      = start_date,
                 end_date        = end_date,
             )
+            raw_cache[instrument] = df_raw
+            qual = qualify_instrument_liquidity(
+                df=df_raw,
+                product_code=product_code,
+                instrument=instrument,
+                rank=rank,
+                analytical_max_rank=analytical_front_n,
+            )
+            qual_cache[instrument] = qual
+            liquidity_rows.append(qual)
 
-            if df_raw is None or len(df_raw) < 30:
+        # Display structure liquidity qualification table
+        struct_liq_df = pd.DataFrame([qual_cache[ins] for ins in instruments])
+        display(style_liquidity_table(
+            struct_liq_df,
+            caption=f"Liquidity Qualification Matrix — {product_code} {structure.upper()} (Front-{analytical_front_n} Analytical vs Pipeline)"
+        ))
+
+        for rank, instrument in enumerate(instruments, 1):
+            qual = qual_cache[instrument]
+            df_raw = raw_cache[instrument]
+            status = qual["status"]
+
+            # Phase 1: Analytical Universe Check
+            if rank > analytical_front_n:
+                print(f"\n  [PIPELINE MONITORING] {instrument} (Rank Front-{rank} > Front-{analytical_front_n}) -- "
+                      f"Retained in pipeline. Status={status} ({qual['reason']})")
+                continue
+
+            # Phase 2: Liquidity Qualification Gate
+            if require_eligible:
+                allow_sweep = (status == "ELIGIBLE") or (include_monitor and status == "MONITOR")
+                if not allow_sweep:
+                    print(f"\n  [LIQUIDITY GATE] {instrument} (Rank Front-{rank}, Status={status}) -- "
+                          f"Skipped from sweep: {qual['reason']}")
+                    continue
+
+            if df_raw is None or len(df_raw) < 20:
                 nb = 0 if df_raw is None else len(df_raw)
                 print(f"\n  [SKIP] {instrument} -- insufficient data ({nb} bars)")
                 continue
@@ -415,23 +509,26 @@ def run_compression_threshold_analysis(
 
             # 5. Outcome summary
             n_total    = len(df_labeled)
+            n_nonzero  = int((pd.to_numeric(df_labeled["compression_score"], errors="coerce") > 0).sum())
             n_censored = int(df_labeled[success_col].isna().sum())
             valid_rows = df_labeled.dropna(subset=[success_col])
             n_valid    = len(valid_rows)
             n_succ     = int((valid_rows[success_col] == 1.0).sum())
             n_fail     = int((valid_rows[success_col] == 0.0).sum())
 
-            print(f"\n  Total compression rows (non-zero score) : {n_total}")
-            print(f"  Censored (forward window not complete)  : {n_censored}")
-            print(f"  Valid rows                              : {n_valid}")
+            print(f"\n  Total trading bars in sample          : {n_total}")
+            print(f"  Bars with non-zero compression score  : {n_nonzero} ({100*n_nonzero/max(1,n_total):.1f}%)")
+            print(f"  Censored (forward window not complete): {n_censored}")
+            print(f"  Valid trading bars evaluated          : {n_valid}")
+            print(f"  Episode mode (forward window overlap) : {episode_mode}")
             if n_valid:
-                print(f"  |-- Success  (1) : {n_succ}   "
+                print(f"  |-- Breakout Success (1) : {n_succ}   "
                       f"({100 * n_succ / n_valid:.1f}%)")
-                print(f"  |-- Failure  (0) : {n_fail}   "
+                print(f"  |-- No Breakout      (0) : {n_fail}   "
                       f"({100 * n_fail / n_valid:.1f}%)")
             else:
-                print("  |-- Success  (1) : 0")
-                print("  |-- Failure  (0) : 0")
+                print("  |-- Breakout Success (1) : 0")
+                print("  |-- No Breakout      (0) : 0")
 
             # 6. Threshold sweep table
             sweep, base_rate = _make_threshold_table(
@@ -443,6 +540,7 @@ def run_compression_threshold_analysis(
                 n_bootstrap  = n_bootstrap,
                 random_seed  = random_seed,
                 forward_days = fwd,
+                episode_mode = episode_mode,
             )
 
             br_str = f"{base_rate:.3f}" if np.isfinite(base_rate) else "n/a"
@@ -483,4 +581,5 @@ def run_compression_threshold_analysis(
                 "base_rate"   : base_rate,
             }
 
+    results["_liquidity_matrix"] = pd.DataFrame(liquidity_rows)
     return results
