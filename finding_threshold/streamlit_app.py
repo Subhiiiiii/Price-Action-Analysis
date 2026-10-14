@@ -36,24 +36,44 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-from market_analysis.config import (
-    PRODUCTS, FRONT_N, COMPRESSION as COMP_CFG,
-)
-from market_analysis.utils.contracts import get_all_front_instruments
-from market_analysis.data.ohlc import fetch_ohlc_1d, getData_OHLC_v2
-from market_analysis.data.liquidity import (
-    qualify_instrument_liquidity,
-    evaluate_softs_liquidity_universe,
-    LIQUIDITY_THRESHOLDS,
-)
-from market_analysis.signals.compression.calculate import calculate_compression
-from market_analysis.signals.compression.label import label_compression
-from market_analysis.finding_threshold.compression_threshold import (
-    _months_back_start,
-    _make_threshold_table,
-    _distribution_plot,
-)
-from market_analysis.utils.metrics import wilson_score_interval, _block_bootstrap_ci
+try:
+    from market_analysis.config import (
+        PRODUCTS, FRONT_N, COMPRESSION as COMP_CFG,
+    )
+    from market_analysis.utils.contracts import get_all_front_instruments
+    from market_analysis.data.ohlc import fetch_ohlc_1d, getData_OHLC_v2
+    from market_analysis.data.liquidity import (
+        qualify_instrument_liquidity,
+        evaluate_softs_liquidity_universe,
+        LIQUIDITY_THRESHOLDS,
+    )
+    from market_analysis.signals.compression.calculate import calculate_compression
+    from market_analysis.signals.compression.label import label_compression
+    from market_analysis.finding_threshold.compression_threshold import (
+        _months_back_start,
+        _make_threshold_table,
+        _distribution_plot,
+    )
+    from market_analysis.utils.metrics import wilson_score_interval, _block_bootstrap_ci
+except ImportError:
+    from config import (
+        PRODUCTS, FRONT_N, COMPRESSION as COMP_CFG,
+    )
+    from utils.contracts import get_all_front_instruments
+    from data.ohlc import fetch_ohlc_1d, getData_OHLC_v2
+    from data.liquidity import (
+        qualify_instrument_liquidity,
+        evaluate_softs_liquidity_universe,
+        LIQUIDITY_THRESHOLDS,
+    )
+    from signals.compression.calculate import calculate_compression
+    from signals.compression.label import label_compression
+    from finding_threshold.compression_threshold import (
+        _months_back_start,
+        _make_threshold_table,
+        _distribution_plot,
+    )
+    from utils.metrics import wilson_score_interval, _block_bootstrap_ci
 
 # ── Page Configuration ────────────────────────────────────────────────────────
 st.set_page_config(

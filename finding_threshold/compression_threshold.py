@@ -43,22 +43,41 @@ from IPython.display import display
 _HERE = Path(__file__).resolve().parent       # .../finding_threshold/
 _ROOT = _HERE.parent                          # .../market_analysis/
 _DOCS = _ROOT.parent                          # .../Documents/
-for _p in [str(_DOCS), str(_ROOT)]:
+for _p in [str(_ROOT), str(_DOCS), str(_HERE)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import types
+if "market_analysis" not in sys.modules:
+    pkg = types.ModuleType("market_analysis")
+    pkg.__path__ = [str(_ROOT)]
+    sys.modules["market_analysis"] = pkg
+
 # -- project imports ----------------------------------------------------------
-from market_analysis.config import (
-    PRODUCTS, FRONT_N,
-    COMPRESSION as COMP_CFG,
-    OHLC_START_DATE, OHLC_END_DATE,
-)
-from market_analysis.utils.contracts import get_all_front_instruments
-from market_analysis.data.ohlc import fetch_ohlc_1d, getData_OHLC_v2
-from market_analysis.signals.compression.calculate import calculate_compression
-from market_analysis.signals.compression.label     import label_compression
-from market_analysis.utils.metrics import _block_bootstrap_ci, wilson_score_interval
-from market_analysis.data.liquidity import qualify_instrument_liquidity, style_liquidity_table
+try:
+    from market_analysis.config import (
+        PRODUCTS, FRONT_N,
+        COMPRESSION as COMP_CFG,
+        OHLC_START_DATE, OHLC_END_DATE,
+    )
+    from market_analysis.utils.contracts import get_all_front_instruments
+    from market_analysis.data.ohlc import fetch_ohlc_1d, getData_OHLC_v2
+    from market_analysis.signals.compression.calculate import calculate_compression
+    from market_analysis.signals.compression.label     import label_compression
+    from market_analysis.utils.metrics import _block_bootstrap_ci, wilson_score_interval
+    from market_analysis.data.liquidity import qualify_instrument_liquidity, style_liquidity_table
+except ImportError:
+    from config import (
+        PRODUCTS, FRONT_N,
+        COMPRESSION as COMP_CFG,
+        OHLC_START_DATE, OHLC_END_DATE,
+    )
+    from utils.contracts import get_all_front_instruments
+    from data.ohlc import fetch_ohlc_1d, getData_OHLC_v2
+    from signals.compression.calculate import calculate_compression
+    from signals.compression.label     import label_compression
+    from utils.metrics import _block_bootstrap_ci, wilson_score_interval
+    from data.liquidity import qualify_instrument_liquidity, style_liquidity_table
 
 # -- colours ------------------------------------------------------------------
 _C_SUCCESS = "seagreen"
