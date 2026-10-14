@@ -37,7 +37,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from IPython.display import display
+try:
+    from IPython.display import display
+except Exception:
+    display = print
 
 # -- project root on sys.path -------------------------------------------------
 _HERE = Path(__file__).resolve().parent       # .../finding_threshold/

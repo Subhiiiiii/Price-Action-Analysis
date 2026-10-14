@@ -24,11 +24,23 @@ for p in [str(_ROOT), str(_DOCS), str(_HERE)]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import types
-if "market_analysis" not in sys.modules:
-    pkg = types.ModuleType("market_analysis")
-    pkg.__path__ = [str(_ROOT)]
+import os
+import importlib.util
+link_path = _ROOT / "market_analysis"
+if not link_path.exists():
+    try:
+        os.symlink(str(_ROOT), str(link_path), target_is_directory=True)
+    except Exception:
+        pass
+
+if "market_analysis" not in sys.modules or not getattr(sys.modules["market_analysis"], "__spec__", None):
+    init_file = _ROOT / "__init__.py"
+    if not init_file.exists():
+        init_file.write_text("# market_analysis\n", encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("market_analysis", str(init_file), submodule_search_locations=[str(_ROOT)])
+    pkg = importlib.util.module_from_spec(spec)
     sys.modules["market_analysis"] = pkg
+    spec.loader.exec_module(pkg)
 
 import numpy as np
 import pandas as pd
