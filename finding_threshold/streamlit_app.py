@@ -218,13 +218,20 @@ with tab_liq:
             else:
                 return "background-color: #f8d7da; color: #721c24; font-weight: bold;"
 
-        st.dataframe(
+        styler = (
             liq_df[[
                 "product", "structure", "rank", "instrument", "universe",
                 "bars", "med_vol_20d", "rvol_20d", "zero_vol_days_20d", "status", "reason"
             ]].style
             .format({"med_vol_20d": "{:,.0f}", "rvol_20d": "{:.2f}", "bars": "{:,d}"})
-            .applymap(color_status, subset=["status"]),
+        )
+        if hasattr(styler, "map"):
+            styler = styler.map(color_status, subset=["status"])
+        else:
+            styler = styler.applymap(color_status, subset=["status"])
+
+        st.dataframe(
+            styler,
             use_container_width=True,
             height=380,
         )
