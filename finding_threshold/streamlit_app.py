@@ -20,9 +20,15 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 _DOCS = _ROOT.parent
-for p in [str(_DOCS), str(_ROOT)]:
+for p in [str(_ROOT), str(_DOCS), str(_HERE)]:
     if p not in sys.path:
         sys.path.insert(0, p)
+
+import types
+if "market_analysis" not in sys.modules:
+    pkg = types.ModuleType("market_analysis")
+    pkg.__path__ = [str(_ROOT)]
+    sys.modules["market_analysis"] = pkg
 
 import numpy as np
 import pandas as pd
