@@ -2,12 +2,11 @@
 __pycache__/
 *.pyc
 
-# Ignore everything inside data/
-data/*
-
-# But track these files
+# Ignore temporary files in data/, but track code and cached CSVs
+data/__pycache__/
 !data/ohlc.py
 !data/liquidity.py
+!data/*/*.csv
 
 # Ignore files inside excel folder
 excels/*

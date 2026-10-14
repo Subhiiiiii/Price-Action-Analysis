@@ -128,7 +128,13 @@ def getData_OHLC_v2(
         f"&extraFields=buyvolume%2Csellvolume"
     )
 
-    r = requests.get(url, headers={"Authorization": f"Bearer {_token}"}, verify=False, timeout=timeout)
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {_token}"}, verify=False, timeout=timeout)
+    except Exception as e:
+        if raise_on_error:
+            raise OHLCFetchError(f"OHLC API request failed for {instrs}: {e}")
+        print(f"  [API NETWORK ERROR] Failed to connect for {instrs}: {e}")
+        return None
 
     if r.status_code != 200:
         if raise_on_error:
@@ -136,7 +142,14 @@ def getData_OHLC_v2(
         print(f"  [API ERROR] {r.status_code} for {instrs}: {r.text[:200]}")
         return None
 
-    resp = r.json()
+    try:
+        resp = r.json()
+    except Exception as e:
+        if raise_on_error:
+            raise OHLCFetchError(f"Non-JSON response from OHLC API: {e}", r.status_code)
+        print(f"  [API JSON ERROR] Could not decode JSON for {instrs}: {e} (Status: {r.status_code})")
+        return None
+
     d    = resp.get("data", resp) if isinstance(resp, dict) else resp
 
     if not d:
